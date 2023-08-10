@@ -1,5 +1,5 @@
 from collections import deque
-import concurrent.futures as concurrency
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import numpy as np
 from moviepy.editor import concatenate_videoclips, VideoFileClip
@@ -83,41 +83,40 @@ class VideoProcessor:
 
         if not cap.isOpened():
             console.print(f"Failed to open video: {video_path}", style="bold red")
-            return 0
+            return 0, 0
 
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         frame_ranges = np.linspace(0, frame_count, num_threads + 1).astype(int)
+        cap.release()
 
         max_variations = [0] * num_threads
         max_variation_indices = [0] * num_threads
 
         with Progress() as progress:
-            task_ids = [
-                progress.add_task("[cyan]Detecting maximum variation...", total=frame_ranges[-1])
-                for _ in range(num_threads)
-            ]
+            task_ids = [progress.add_task("[cyan]Detecting maximum variation...", total=frame_count) for _ in range(num_threads)]
+            progress_dicts = [{"completed": 0} for _ in range(num_threads)]
+            process_frame_range = self.process_frame_range
 
-            process_frame_range = self.process_frame_range  # Local reference
-
-            with concurrency.futures.ThreadPoolExecutor() as executor:
-                futures = [
+            with ThreadPoolExecutor() as executor:
+                futures = {
                     executor.submit(
-                        process_frame_range,  # Use local reference
+                        process_frame_range,
                         video_path,
                         frame_ranges[i],
                         frame_ranges[i + 1],
                         fps,
                         window_size,
-                        progress.tasks[task_ids[i]],
-                    )
-                    for i in range(num_threads)
-                ]
+                        progress_dicts[i],
+                    ): i for i in range(num_threads)
+                }
 
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                for future in as_completed(futures):
+                    i = futures[future]
                     max_variations[i], max_variation_indices[i] = future.result()
+                    progress.update(task_ids[i], completed=progress_dicts[i]["completed"])
 
-        return max_variation_indices[np.argmax(max_variations)], frame_ranges
+        return max_variation_indices[np.argmax(max_variations)], frame_count
 
     def extract_10_sec_action(
         self,
@@ -193,19 +192,20 @@ class VideoProcessor:
         tmdb_api = TMDBAPI()  # Instantiate once
         vdp = VideoDownloadProcessor()
         movie_files = []
+
         if not movies_list:
             movie_names = await tmdb_api.get_popular_movies()
             console.print(f"Found {len(movie_names)} popular movies.", style="bold blue")
             movies_list = [os.path.join(DOWNLOAD_FOLDER, f"{movie_name}_trailer.mp4") for movie_name in movie_names]
 
             console.print(f"Downloading trailers for {len(movies_list)} popular movies...", style="bold blue")
-
             for movie_name in movie_names:
                 trailer_link = await tmdb_api.get_trailer_link(movie_name)
                 if trailer_link:  # Check if we got a valid link
                     await vdp.download_video(trailer_link, movie_name)
-
             console.print(f"Downloaded trailers for {len(movies_list)} popular movies.", style="bold blue")
+            # get all the files in DOWNLOAD_FOLDER
+            movie_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.endswith('_trailer.mp4')]
         else:
             movie_names = [os.path.basename(movie).replace('_trailer.mp4', '').replace('__', ': ') for movie in movies_list]
             movie_files = [f for f in os.listdir(DOWNLOAD_FOLDER) if f.endswith('_trailer.mp4')]
@@ -216,7 +216,6 @@ class VideoProcessor:
             full_video_path = os.path.join(DOWNLOAD_FOLDER, video_file)
             movie_name = os.path.basename(video_file).replace('_trailer.mp4', '')
 
-            # Get the fps of the video
             cap = cv2.VideoCapture(full_video_path)
             if not cap.isOpened():
                 console.print(f"Failed to open video: {full_video_path}", style="bold red")
@@ -229,8 +228,7 @@ class VideoProcessor:
             action_clip_file = full_video_path.replace(".mp4", "_action.mp4")
             console.print(f"Analyzing {movie_name} trailer...", style="bold blue")
 
-            max_variation_index, frame_ranges = self.detect_max_variation(full_video_path, self.num_threads, self.window_size)
-
+            max_variation_index, _ = self.detect_max_variation(full_video_path, self.num_threads, self.window_size)
             self.extract_10_sec_action(full_video_path, max_variation_index, action_clip_file)
 
             if not os.path.exists(action_clip_file):
@@ -239,33 +237,7 @@ class VideoProcessor:
 
             action_clips.append(action_clip_file)
 
-        # Here's where the progress tracking mechanism starts
-        with Progress() as progress:
-            task_ids = [progress.add_task("[cyan]Detecting maximum variation...", total=frame_ranges[-1]) for _ in range(self.num_threads)]
-            progress_dicts = [{"completed": 0} for _ in range(self.num_threads)]  # List of dictionaries
-
-            process_frame_range = self.process_frame_range
-
-            with concurrency.futures.ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(
-                        process_frame_range,
-                        full_video_path,  # Use the full_video_path instead of video_path
-                        frame_ranges[i],
-                        frame_ranges[i + 1],
-                        fps,
-                        self.window_size,
-                        progress_dicts[i],  # Pass the dictionary
-                    )
-                    for i in range(self.num_threads)
-                ]
-
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    _, _ = future.result()
-                    progress.update(task_ids[i], completed=progress_dicts[i]["completed"])  # Update progress
-
         console.print("Combining all action sequences...", style="bold blue")
         self.combine_videos(action_clips, output_file)
         console.print(f"All action sequences combined into {output_file}.", style="bold blue")
         await tmdb_api.client.aclose()
-
