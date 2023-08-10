@@ -1,0 +1,9 @@
+typer
+rich
+yt-dlp
+httpx
+beautifulsoup4
+numpy
+opencv-python
+asyncio
+moviepy
